@@ -156,7 +156,20 @@ enum Commands {
     /// SDI virtual serial port,
     #[command(subcommand)]
     SdiPrint(SdiPrint),
+    /// Machine-readable bridge helper commands
+    #[command(subcommand)]
+    Bridge(Bridge),
     Dev {},
+}
+
+#[derive(clap::Subcommand, PartialEq, Clone, Debug)]
+pub enum Bridge {
+    /// Run a JSONL stdin/stdout bridge daemon
+    Daemon {
+        /// Emit and accept newline-delimited JSON protocol
+        #[arg(long, default_value = "false")]
+        jsonl: bool,
+    },
 }
 
 #[derive(clap::Subcommand, PartialEq, Clone, Debug)]
@@ -226,6 +239,17 @@ fn main() -> Result<()> {
         }
         Some(Commands::SetPower { cmd }) => {
             WchLink::set_power_output_enabled(device_index, cmd)?;
+        }
+        Some(Commands::Bridge(Bridge::Daemon { jsonl })) => {
+            if !jsonl {
+                return Err(wlink::Error::Custom(
+                    "bridge daemon currently requires --jsonl".into(),
+                )
+                .into());
+            }
+            let stdin = std::io::stdin();
+            let stdout = std::io::stdout();
+            wlink::bridge::run_jsonl_daemon(stdin.lock(), stdout.lock())?;
         }
 
         Some(Commands::Erase { method }) if method != EraseMode::Default => {

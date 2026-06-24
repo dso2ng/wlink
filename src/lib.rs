@@ -1,5 +1,6 @@
 //! The wlink library.
 
+pub mod bridge;
 pub mod chips;
 pub mod commands;
 pub mod dmi;

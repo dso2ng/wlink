@@ -316,6 +316,8 @@ pub enum SerialWatchOutput {
     Plain,
     /// Emit one JSON object per completed line.
     Jsonl,
+    /// Emit bridge-daemon event JSON objects per completed line.
+    BridgeJsonl,
 }
 
 fn select_wch_link_serial_port(
@@ -405,7 +407,10 @@ impl SerialWatchPrinter {
         match self.output {
             SerialWatchOutput::Timestamped => self.write_timestamped(s, sink, timestamp),
             SerialWatchOutput::Plain => sink.write_str(s),
-            SerialWatchOutput::Jsonl => self.write_jsonl(s, sink),
+            SerialWatchOutput::Jsonl => self.write_jsonl(s, sink, JsonlLineShape::Standalone),
+            SerialWatchOutput::BridgeJsonl => {
+                self.write_jsonl(s, sink, JsonlLineShape::BridgeEvent)
+            }
         }
     }
 
@@ -434,15 +439,26 @@ impl SerialWatchPrinter {
         Ok(())
     }
 
-    fn write_jsonl(&mut self, s: &str, sink: &mut dyn SerialWatchSink) -> Result<()> {
+    fn write_jsonl(
+        &mut self,
+        s: &str,
+        sink: &mut dyn SerialWatchSink,
+        shape: JsonlLineShape,
+    ) -> Result<()> {
         for c in s.chars() {
             if c == '\r' || c == '\n' {
                 if !self.jsonl_line.is_empty() {
                     let escaped = escape_json_string(&self.jsonl_line);
-                    sink.write_str(&format!(
-                        "{{\"type\":\"sdi.line\",\"line\":\"{}\"}}\n",
-                        escaped
-                    ))?;
+                    let line = match shape {
+                        JsonlLineShape::Standalone => {
+                            format!("{{\"type\":\"sdi.line\",\"line\":\"{}\"}}\n", escaped)
+                        }
+                        JsonlLineShape::BridgeEvent => format!(
+                            "{{\"type\":\"event\",\"event\":\"sdi.line\",\"line\":\"{}\"}}\n",
+                            escaped
+                        ),
+                    };
+                    sink.write_str(&line)?;
                     self.jsonl_line.clear();
                 }
             } else {
@@ -451,6 +467,12 @@ impl SerialWatchPrinter {
         }
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum JsonlLineShape {
+    Standalone,
+    BridgeEvent,
 }
 
 fn escape_json_string(s: &str) -> String {
@@ -655,6 +677,21 @@ mod tests {
         assert_eq!(
             sink.0,
             "{\"type\":\"sdi.line\",\"line\":\"quote \\\" slash \\\\ tab\\t\"}\n"
+        );
+    }
+
+    #[test]
+    fn bridge_jsonl_printer_emits_event_lines() {
+        let mut printer = SerialWatchPrinter::new(SerialWatchOutput::BridgeJsonl);
+        let mut sink = StringSink::default();
+
+        printer
+            .write_str_with_timestamp("no Card\n", &mut sink, || "TS".to_string())
+            .unwrap();
+
+        assert_eq!(
+            sink.0,
+            "{\"type\":\"event\",\"event\":\"sdi.line\",\"line\":\"no Card\"}\n"
         );
     }
 }

@@ -6,7 +6,7 @@ use wlink::{
     dmi::DebugModuleInterface,
     firmware::{Firmware, read_firmware_from_file},
     operations::ProbeSession,
-    probe::WchLink,
+    probe::{SerialWatchOutput, WatchSerialOptions, WchLink},
     regs,
 };
 
@@ -165,11 +165,20 @@ pub enum SdiPrint {
     Enable,
     /// Disable SDI print
     Disable,
+    /// Watch WCH-Link SDI print output from the WCH-Link serial port
+    Watch {
+        /// Print decoded SDI text without host-side timestamps
+        #[arg(long, default_value = "false")]
+        no_timestamp: bool,
+        /// Emit completed SDI lines as JSONL records
+        #[arg(long, default_value = "false", conflicts_with = "no_timestamp")]
+        jsonl: bool,
+    },
 }
 
 impl SdiPrint {
     pub fn is_enable(&self) -> bool {
-        *self == SdiPrint::Enable
+        matches!(self, SdiPrint::Enable)
     }
 }
 
@@ -232,6 +241,22 @@ fn main() -> Result<()> {
                 }
                 _ => unreachable!(),
             }
+        }
+        Some(Commands::SdiPrint(SdiPrint::Watch {
+            no_timestamp,
+            jsonl,
+        })) => {
+            let output = if jsonl {
+                SerialWatchOutput::Jsonl
+            } else if no_timestamp {
+                SerialWatchOutput::Plain
+            } else {
+                SerialWatchOutput::Timestamped
+            };
+            wlink::probe::watch_serial_with_options(WatchSerialOptions {
+                output,
+                ..Default::default()
+            })?;
         }
         Some(command) => {
             let probe = WchLink::open_nth(device_index)?;
@@ -426,6 +451,7 @@ fn main() -> Result<()> {
                         log::info!("Disabling SDI print");
                         sess.set_sdi_print_enabled(false)?;
                     }
+                    SdiPrint::Watch { .. } => unreachable!(),
                 },
                 _ => unreachable!("unimplemented command"),
             }

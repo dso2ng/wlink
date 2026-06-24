@@ -271,19 +271,48 @@ impl WchLink {
 
 /// Helper for SDI print
 pub fn watch_serial() -> Result<()> {
+    watch_serial_with_options(WatchSerialOptions::default())
+}
+
+pub fn watch_serial_with_options(options: WatchSerialOptions) -> Result<()> {
     let port_info = find_wch_link_serial_port(serialport::available_ports()?)
         .ok_or_else(|| Error::Custom("No serial port found".to_string()))?;
     log::debug!("Opening serial port: {:?}", port_info.port_name);
 
-    let mut port = serialport::new(&port_info.port_name, 115200)
+    let mut port = serialport::new(&port_info.port_name, options.baud)
         .timeout(std::time::Duration::from_millis(1000))
         .open()?;
 
     log::trace!("Serial port opened: {:?}", port);
 
-    let mut printer = TimestampedSerialPrinter::default();
+    let mut printer = SerialWatchPrinter::new(options.output);
     let mut sink = StdoutSerialWatchSink;
     watch_serial_port(&mut *port, &mut printer, &mut sink)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WatchSerialOptions {
+    pub baud: u32,
+    pub output: SerialWatchOutput,
+}
+
+impl Default for WatchSerialOptions {
+    fn default() -> Self {
+        Self {
+            baud: 115200,
+            output: SerialWatchOutput::Timestamped,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SerialWatchOutput {
+    /// Preserve the historical human-oriented output with timestamps at line starts.
+    Timestamped,
+    /// Forward decoded text without adding timestamps.
+    Plain,
+    /// Emit one JSON object per completed line.
+    Jsonl,
 }
 
 fn find_wch_link_serial_port(
@@ -316,17 +345,21 @@ impl SerialWatchSink for StdoutSerialWatchSink {
     }
 }
 
-struct TimestampedSerialPrinter {
+struct SerialWatchPrinter {
+    output: SerialWatchOutput,
     line_start: bool,
+    jsonl_line: String,
 }
 
-impl Default for TimestampedSerialPrinter {
-    fn default() -> Self {
-        Self { line_start: true }
+impl SerialWatchPrinter {
+    fn new(output: SerialWatchOutput) -> Self {
+        Self {
+            output,
+            line_start: true,
+            jsonl_line: String::new(),
+        }
     }
-}
 
-impl TimestampedSerialPrinter {
     fn write_bytes(&mut self, bytes: &[u8], sink: &mut dyn SerialWatchSink) -> Result<()> {
         self.write_str(&String::from_utf8_lossy(bytes), sink)
     }
@@ -340,6 +373,19 @@ impl TimestampedSerialPrinter {
     }
 
     fn write_str_with_timestamp(
+        &mut self,
+        s: &str,
+        sink: &mut dyn SerialWatchSink,
+        timestamp: impl Fn() -> String,
+    ) -> Result<()> {
+        match self.output {
+            SerialWatchOutput::Timestamped => self.write_timestamped(s, sink, timestamp),
+            SerialWatchOutput::Plain => sink.write_str(s),
+            SerialWatchOutput::Jsonl => self.write_jsonl(s, sink),
+        }
+    }
+
+    fn write_timestamped(
         &mut self,
         s: &str,
         sink: &mut dyn SerialWatchSink,
@@ -363,11 +409,47 @@ impl TimestampedSerialPrinter {
         }
         Ok(())
     }
+
+    fn write_jsonl(&mut self, s: &str, sink: &mut dyn SerialWatchSink) -> Result<()> {
+        for c in s.chars() {
+            if c == '\r' || c == '\n' {
+                if !self.jsonl_line.is_empty() {
+                    let escaped = escape_json_string(&self.jsonl_line);
+                    sink.write_str(&format!(
+                        "{{\"type\":\"sdi.line\",\"line\":\"{}\"}}\n",
+                        escaped
+                    ))?;
+                    self.jsonl_line.clear();
+                }
+            } else {
+                self.jsonl_line.push(c);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn escape_json_string(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn watch_serial_port(
     port: &mut dyn serialport::SerialPort,
-    printer: &mut TimestampedSerialPrinter,
+    printer: &mut SerialWatchPrinter,
     sink: &mut dyn SerialWatchSink,
 ) -> Result<()> {
     loop {
@@ -432,7 +514,7 @@ mod tests {
 
     #[test]
     fn timestamped_printer_defaults_to_line_start() {
-        let mut printer = TimestampedSerialPrinter::default();
+        let mut printer = SerialWatchPrinter::new(SerialWatchOutput::Timestamped);
         let mut sink = StringSink::default();
 
         printer
@@ -444,7 +526,7 @@ mod tests {
 
     #[test]
     fn timestamped_printer_keeps_existing_line_format() {
-        let mut printer = TimestampedSerialPrinter { line_start: true };
+        let mut printer = SerialWatchPrinter::new(SerialWatchOutput::Timestamped);
         let mut sink = StringSink::default();
 
         printer
@@ -456,7 +538,7 @@ mod tests {
 
     #[test]
     fn timestamped_printer_preserves_partial_line_across_chunks() {
-        let mut printer = TimestampedSerialPrinter { line_start: true };
+        let mut printer = SerialWatchPrinter::new(SerialWatchOutput::Timestamped);
         let mut sink = StringSink::default();
 
         printer
@@ -467,5 +549,44 @@ mod tests {
             .unwrap();
 
         assert_eq!(sink.0, "TS: abc\n");
+    }
+
+    #[test]
+    fn plain_printer_does_not_add_timestamps() {
+        let mut printer = SerialWatchPrinter::new(SerialWatchOutput::Plain);
+        let mut sink = StringSink::default();
+
+        printer
+            .write_str_with_timestamp("abc\ndef", &mut sink, || "TS".to_string())
+            .unwrap();
+
+        assert_eq!(sink.0, "abc\ndef");
+    }
+
+    #[test]
+    fn jsonl_printer_emits_completed_lines() {
+        let mut printer = SerialWatchPrinter::new(SerialWatchOutput::Jsonl);
+        let mut sink = StringSink::default();
+
+        printer
+            .write_str_with_timestamp("no Card\npartial", &mut sink, || "TS".to_string())
+            .unwrap();
+
+        assert_eq!(sink.0, "{\"type\":\"sdi.line\",\"line\":\"no Card\"}\n");
+    }
+
+    #[test]
+    fn jsonl_printer_escapes_json_strings() {
+        let mut printer = SerialWatchPrinter::new(SerialWatchOutput::Jsonl);
+        let mut sink = StringSink::default();
+
+        printer
+            .write_str_with_timestamp("quote \" slash \\ tab\t\n", &mut sink, || "TS".to_string())
+            .unwrap();
+
+        assert_eq!(
+            sink.0,
+            "{\"type\":\"sdi.line\",\"line\":\"quote \\\" slash \\\\ tab\\t\"}\n"
+        );
     }
 }

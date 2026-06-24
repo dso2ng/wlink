@@ -2,8 +2,9 @@ use std::io::{BufRead, Write};
 
 use serde::{Deserialize, Serialize};
 
-use crate::probe::{SerialWatchOutput, WatchSerialOptions};
-use crate::{Error, Result};
+use crate::operations::ProbeSession;
+use crate::probe::{SerialWatchOutput, WatchSerialOptions, WchLink};
+use crate::{Error, Result, RiscvChip, commands::Speed};
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 pub struct BridgeCommand {
@@ -103,6 +104,7 @@ pub fn run_jsonl_daemon<R: BufRead, W: Write>(reader: R, mut writer: W) -> Resul
             "sdi.start" => {
                 writeln!(writer, "{}", response_json(&cmd.id, Some("sdi"))?)?;
                 writer.flush()?;
+                enable_sdi_print_for_bridge_watch()?;
                 crate::probe::watch_serial_with_options(cmd.sdi_watch_options())?;
                 return Ok(());
             }
@@ -112,6 +114,14 @@ pub fn run_jsonl_daemon<R: BufRead, W: Write>(reader: R, mut writer: W) -> Resul
             }
         }
     }
+    Ok(())
+}
+
+fn enable_sdi_print_for_bridge_watch() -> Result<()> {
+    let probe = WchLink::open_nth(0)?;
+    let mut sess = ProbeSession::attach(probe, Some(RiscvChip::CH32V00X), Speed::High)?;
+    sess.soft_reset()?;
+    sess.set_sdi_print_enabled(true)?;
     Ok(())
 }
 

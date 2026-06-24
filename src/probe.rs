@@ -275,11 +275,10 @@ pub fn watch_serial() -> Result<()> {
 }
 
 pub fn watch_serial_with_options(options: WatchSerialOptions) -> Result<()> {
-    let port_info = find_wch_link_serial_port(serialport::available_ports()?)
-        .ok_or_else(|| Error::Custom("No serial port found".to_string()))?;
-    log::debug!("Opening serial port: {:?}", port_info.port_name);
+    let port_name = select_wch_link_serial_port(serialport::available_ports()?, &options)?;
+    log::debug!("Opening serial port: {:?}", port_name);
 
-    let mut port = serialport::new(&port_info.port_name, options.baud)
+    let mut port = serialport::new(&port_name, options.baud)
         .timeout(std::time::Duration::from_millis(1000))
         .open()?;
 
@@ -290,10 +289,12 @@ pub fn watch_serial_with_options(options: WatchSerialOptions) -> Result<()> {
     watch_serial_port(&mut *port, &mut printer, &mut sink)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatchSerialOptions {
     pub baud: u32,
     pub output: SerialWatchOutput,
+    pub port_name: Option<String>,
+    pub probe_serial: Option<String>,
 }
 
 impl Default for WatchSerialOptions {
@@ -301,6 +302,8 @@ impl Default for WatchSerialOptions {
         Self {
             baud: 115200,
             output: SerialWatchOutput::Timestamped,
+            port_name: None,
+            probe_serial: None,
         }
     }
 }
@@ -315,15 +318,36 @@ pub enum SerialWatchOutput {
     Jsonl,
 }
 
-fn find_wch_link_serial_port(
+fn select_wch_link_serial_port(
     ports: impl IntoIterator<Item = serialport::SerialPortInfo>,
-) -> Option<serialport::SerialPortInfo> {
-    ports.into_iter().find(is_wch_link_serial_port)
+    options: &WatchSerialOptions,
+) -> Result<String> {
+    if let Some(port_name) = &options.port_name {
+        return Ok(port_name.clone());
+    }
+
+    find_wch_link_serial_port(ports, options.probe_serial.as_deref())
+        .map(|port| port.port_name)
+        .ok_or_else(|| Error::Custom("No serial port found".to_string()))
 }
 
-fn is_wch_link_serial_port(port: &serialport::SerialPortInfo) -> bool {
+fn find_wch_link_serial_port(
+    ports: impl IntoIterator<Item = serialport::SerialPortInfo>,
+    probe_serial: Option<&str>,
+) -> Option<serialport::SerialPortInfo> {
+    ports
+        .into_iter()
+        .find(|port| is_wch_link_serial_port(port, probe_serial))
+}
+
+fn is_wch_link_serial_port(port: &serialport::SerialPortInfo, probe_serial: Option<&str>) -> bool {
+    let serial_matches = |info: &serialport::UsbPortInfo| match probe_serial {
+        Some(expected) => info.serial_number.as_deref() == Some(expected),
+        None => true,
+    };
+
     if let serialport::SerialPortType::UsbPort(info) = &port.port_type {
-        info.vid == VENDOR_ID && info.pid == PRODUCT_ID
+        info.vid == VENDOR_ID && info.pid == PRODUCT_ID && serial_matches(info)
     } else {
         false
     }
@@ -477,12 +501,21 @@ mod tests {
     }
 
     fn usb_port(name: &str, vid: u16, pid: u16) -> serialport::SerialPortInfo {
+        usb_port_with_serial(name, vid, pid, None)
+    }
+
+    fn usb_port_with_serial(
+        name: &str,
+        vid: u16,
+        pid: u16,
+        serial_number: Option<&str>,
+    ) -> serialport::SerialPortInfo {
         serialport::SerialPortInfo {
             port_name: name.to_string(),
             port_type: serialport::SerialPortType::UsbPort(serialport::UsbPortInfo {
                 vid,
                 pid,
-                serial_number: None,
+                serial_number: serial_number.map(str::to_string),
                 manufacturer: None,
                 product: None,
             }),
@@ -492,13 +525,13 @@ mod tests {
     #[test]
     fn matches_wch_link_serial_port_by_vid_pid() {
         let port = usb_port("/dev/ttyACM0", VENDOR_ID, PRODUCT_ID);
-        assert!(is_wch_link_serial_port(&port));
+        assert!(is_wch_link_serial_port(&port, None));
     }
 
     #[test]
     fn rejects_non_wch_link_serial_port() {
         let port = usb_port("/dev/ttyACM0", VENDOR_ID, PRODUCT_ID_DAP);
-        assert!(!is_wch_link_serial_port(&port));
+        assert!(!is_wch_link_serial_port(&port, None));
     }
 
     #[test]
@@ -508,8 +541,43 @@ mod tests {
             usb_port("/dev/ttyACM1", VENDOR_ID, PRODUCT_ID),
         ];
 
-        let port = find_wch_link_serial_port(ports).unwrap();
+        let port = find_wch_link_serial_port(ports, None).unwrap();
         assert_eq!(port.port_name, "/dev/ttyACM1");
+    }
+
+    #[test]
+    fn explicit_watch_port_takes_precedence_over_discovery() {
+        let options = WatchSerialOptions {
+            port_name: Some("/dev/serial/by-id/wch-link".to_string()),
+            ..Default::default()
+        };
+
+        let port = select_wch_link_serial_port(Vec::new(), &options).unwrap();
+
+        assert_eq!(port, "/dev/serial/by-id/wch-link");
+    }
+
+    #[test]
+    fn finds_wch_link_serial_port_by_probe_serial() {
+        let ports = vec![
+            usb_port_with_serial("/dev/ttyACM0", VENDOR_ID, PRODUCT_ID, Some("OTHER")),
+            usb_port_with_serial("/dev/ttyACM1", VENDOR_ID, PRODUCT_ID, Some("8B0B8F060FCB")),
+        ];
+
+        let port = find_wch_link_serial_port(ports, Some("8B0B8F060FCB")).unwrap();
+        assert_eq!(port.port_name, "/dev/ttyACM1");
+    }
+
+    #[test]
+    fn rejects_wch_link_serial_port_with_different_probe_serial() {
+        let ports = vec![usb_port_with_serial(
+            "/dev/ttyACM0",
+            VENDOR_ID,
+            PRODUCT_ID,
+            Some("OTHER"),
+        )];
+
+        assert!(find_wch_link_serial_port(ports, Some("8B0B8F060FCB")).is_none());
     }
 
     #[test]

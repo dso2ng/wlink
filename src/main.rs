@@ -159,7 +159,7 @@ enum Commands {
     Dev {},
 }
 
-#[derive(clap::Subcommand, PartialEq, Clone, Copy, Debug)]
+#[derive(clap::Subcommand, PartialEq, Clone, Debug)]
 pub enum SdiPrint {
     /// Enable SDI print, implies --no-detach
     Enable,
@@ -173,6 +173,12 @@ pub enum SdiPrint {
         /// Emit completed SDI lines as JSONL records
         #[arg(long, default_value = "false", conflicts_with = "no_timestamp")]
         jsonl: bool,
+        /// Open this serial port instead of auto-detecting the WCH-Link CDC port
+        #[arg(long, value_name = "PORT", conflicts_with = "probe_serial")]
+        watch_port: Option<String>,
+        /// Select the WCH-Link CDC port by USB serial number
+        #[arg(long, value_name = "SERIAL")]
+        probe_serial: Option<String>,
     },
 }
 
@@ -245,6 +251,8 @@ fn main() -> Result<()> {
         Some(Commands::SdiPrint(SdiPrint::Watch {
             no_timestamp,
             jsonl,
+            watch_port,
+            probe_serial,
         })) => {
             let output = if jsonl {
                 SerialWatchOutput::Jsonl
@@ -255,6 +263,8 @@ fn main() -> Result<()> {
             };
             wlink::probe::watch_serial_with_options(WatchSerialOptions {
                 output,
+                port_name: watch_port,
+                probe_serial,
                 ..Default::default()
             })?;
         }

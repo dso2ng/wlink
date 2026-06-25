@@ -122,6 +122,7 @@ fn enable_sdi_print_for_bridge_watch() -> Result<()> {
     let mut sess = ProbeSession::attach(probe, Some(RiscvChip::CH32V00X), Speed::High)?;
     sess.soft_reset()?;
     sess.set_sdi_print_enabled(true)?;
+    sess.ensure_mcu_resume()?;
     Ok(())
 }
 
